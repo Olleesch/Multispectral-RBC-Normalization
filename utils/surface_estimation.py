@@ -3,46 +3,58 @@ import gc
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
-from tqdm import tqdm
 
 import cv2
 import gpytorch
 import torch
 
 from joblib import Parallel, delayed
-
 from scipy.optimize import curve_fit
 from scipy.ndimage import binary_dilation, binary_erosion
 from sklearn.preprocessing import minmax_scale
 
+from .data import check_sample_format
+
 
 """ Binary Mask Construction """
 
-def get_masks(sample,
-              segmentation_model, 
-              plot: bool = False,
-              verbose: bool = False):
-    """ 
+def get_masks(
+    sample: np.ndarray,
+    segmentation_model, 
+    plot: bool = False,
+    verbose: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
+    """ Constructs the binary background and cell masks
+
+    Args:
+        sample: A numpy array with the sample data, format (M, C, H, W),
+                M - number of modalities, C - number of channels, H - image height, W - image width.
+        segmentation_model: A CellPose segmentation model.
+        plot: A boolean to indicate whether to plot the masks or not. 
+        verbose: A boolean to indicate whether to print detailed information during processing or not.
     
+    Returns:
+        tuple - Two 2D arrays, one with the background mask and one with the cell mask of shape (H, W).
     """
     if verbose:
         print("Constructing Binary Masks...")
-
+    
+    # Get modalities from sample
     image_R = sample[0]
     image_S = sample[1]
     image_T = sample[2]
 
     # Cell segmentation can be performed on a combined image, averaging all channels in
-    # reflected, scattered and transmitted images
-    combined_image = minmax_scale(image_R.mean(0)-image_S.mean(0)+image_T.mean(0))
+    # the reflectance, the inverted scattering and the transmittance images
+    combined_image = minmax_scale(image_R.mean(0)+(1-image_S.mean(0))+image_T.mean(0))
     
     # Segment cells
     mask, _, _, _ = segmentation_model.eval(combined_image, channels=[0, 0], diameter=35)
 
-    # Background mask
+    # Get background pixels
     background_mask = np.where(mask == 0, 1, 0)
 
-    # Dilude background mask a bit
+    # Erode background mask a bit
     background_mask = binary_erosion(background_mask, iterations=10)
 
     # Compute the average value of the background and filter out pixels deviating to 
@@ -53,7 +65,8 @@ def get_masks(sample,
     deviation_mask = (combined_image - mean_intensity) < intensity_deviation_threshold
     background_mask[deviation_mask] = 0
 
-    # Compute local mean for the background
+    # Compute local average value and filter out pixels with lower values to
+    # remove background deformations from the background mask. 
     intensity_deviation_threshold = 0
     local_mean = cv2.blur(combined_image * background_mask, (32, 32))
     local_count = cv2.blur(background_mask.astype(float), (32, 32))
@@ -61,8 +74,10 @@ def get_masks(sample,
     deviation_mask = (combined_image - local_mean) < intensity_deviation_threshold
     background_mask[deviation_mask] = 0
     
-    # Cell mask
+    # Get cell pixels
     cell_mask = np.where(mask != 0, 1, 0)
+
+    # Dilate the mask a bit
     cell_mask = binary_dilation(cell_mask, iterations=5)
 
     # Plot combined image and masks
@@ -114,44 +129,48 @@ def get_masks(sample,
 
 """ Background Surface Estimation """
 
-def fit_polynomial_background(sample: np.ndarray, 
-                              mask: np.ndarray, 
-                              degree: int = 2,
-                              verbose: bool = False):
-    """
-    Fit a polynomial background to an image considering only background pixels indicated by a binary mask. 
+def fit_polynomial_background(
+    sample: np.ndarray, 
+    mask: np.ndarray, 
+    degree: int = 2,
+    verbose: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
+    """ Fits a polynomial background surface to a sample.
+
+    Fits a  polynomial background surface to background pixels indicated by a background mask through 
+    least squares optimization which in this case is equal to minimizing mean squared error between 
+    the surface and background pixels. 
     
     Parameters:
-        image (ndarray): Input image of shape (C, H, W) or (H, W). Pixel values should be floats. 
-        mask (ndarray): Binary mask of shape (H, W), where `0` indicates background pixels.
-        degree (int): Degree of the polynomial. Currently only support degree 1, 2, or 3. 
+        sample: Input sample of shape (M, C, H, W), M - number of modalities, C - number of channels, 
+                H - image height, W - image width. Pixel values should be floats.
+        mask: Binary mask of shape (H, W), where 1 indicates background pixels.
+        degree: Degree of the polynomial. Currently only support degrees 1, 2, or 3. 
+        verbose: A boolean to indicate whether to print detailed information during processing or not.
     
     Returns:
-        tuple: Normalized image and fitted background.
+        tuple - Background-corrected sample and fitted background surfaces as numpy arrays of same size as input sample. 
     """
+    if verbose: 
+        print(f"Fitting Background Surface...")
 
     def poly1d(x, y, p):
-        """ Evaluate a 1D polynomial """
+        """ 1D polynomial """
         return p[0] + p[1]*x + p[2]*y
 
     def poly2d(x, y, p):
-        """ Evaluate a 2D polynomial """
+        """ 2D polynomial """
         return p[0] + p[1]*x + p[2]*y + p[3]*x**2 + p[4]*y**2 + p[5]*x*y
 
     def poly3d(x, y, p):
-        """ Evaluate a 3D polynomial """
+        """ 3D polynomial """
         return p[0] + p[1]*x + p[2]*y + p[3]*x**2 + p[4]*y**2 + p[5]*x*y + p[6]*x**3 + p[7]*y**3 + p[8]*x**2*y + p[9]*x*y**2
 
-    # TODO: Fix shape assert
-    # # Check format of inputs
-    # if len(image.shape) == 2:
-    #     image = np.expand_dims(image, 0)
-    # assert len(image.shape) == 3, \
-    #     f"Error: Invalid image shape. Got shape {image.shape}, but require shape on form (C, H, W). "
-    # assert mask.shape == image.shape[1:], \
-    #     f"Error: Mask shape does not match image shape. Got mask shape {mask.shape}, but require shape on form (C, H, W). "
-    if verbose: 
-        print(f"Fitting Background Surface...")
+    # Check format of inputs
+    sample = check_sample_format(sample, allow_multiple=False)
+        
+    assert mask.shape == sample.shape[2:], \
+        f"Error: Mask and sample image dimensions do not match. Got mask shape {mask.shape} and sample image shape {sample.shape[2:]}."
 
     # Set polynomial degree and initial guess
     if degree == 1:
@@ -166,8 +185,10 @@ def fit_polynomial_background(sample: np.ndarray,
     else:
         raise ValueError("Only polynomials of degree 1, 2, and 3 are currently supported.")
 
-    # Help function to fit background per channel
     def fit_polynomial_background_(channel, mask):
+        """ Help function to fit polynomial to background. """
+
+        # Extract x, y coordinates, z values and mask values
         H, W = channel.shape
         x, y = np.meshgrid(np.arange(W), np.arange(H))
         x = x.ravel()
@@ -181,25 +202,24 @@ def fit_polynomial_background(sample: np.ndarray,
         z = z[m == 1]
 
         # Fit 2D polynomial
-        opt_params, _ = curve_fit(lambda data, *p: poly(data[0], data[1], p), (x, y), z, p0=p0)
+        optimal_params, _ = curve_fit(lambda data, *p: poly(data[0], data[1], p), (x, y), z, p0=p0)
 
-        # Generate the fitted background
+        # Compute background over the entire image from optimal polynomial parameters
         fitted_channel_background = poly(
             np.meshgrid(np.arange(W), np.arange(H))[0], 
             np.meshgrid(np.arange(W), np.arange(H))[1], 
-            opt_params
+            optimal_params
         )
 
-        # Normalize channel by subracting the estimated background
+        # Normalize channel by background subtraction
         normalized_channel = channel - fitted_channel_background
-
         return normalized_channel, fitted_channel_background
     
     # Allocate normalized sample and fitted background
     background_corrected_sample = np.zeros_like(sample)
     fitted_background = np.zeros_like(sample)
 
-    # Normalize sample channels by fitting polynomial background plane
+    # Fit polynomial planes to each channel in parallel
     results = Parallel(n_jobs=-1)(
         delayed(lambda i, c: (i, c, *fit_polynomial_background_(sample[i, c], mask)))(i, c) 
         for i in range(sample.shape[0]) 
@@ -216,14 +236,51 @@ def fit_polynomial_background(sample: np.ndarray,
 
 """ Red Blood Cell Intensity Magnitude Surface Estimation """
 
-def fit_gpr_surface(sample: np.ndarray, 
-                    mask: np.ndarray, 
-                    sample_fraction: float = 0.001,
-                    verbose: bool = False):
+def fit_gpr_surface(
+    sample: np.ndarray, 
+    mask: np.ndarray, 
+    sample_fraction: float = 0.001,
+    verbose: bool = False
+) -> tuple[np.ndarray, np.ndarray]:
+    """ Fits a smooth surface to the local average cell intensity magnitude. 
+
+    Fits a smooth surface to sampled values of the local average cell intensity magnitude through Gaussing 
+    process regression with a constant mean function and an RBF kernel covariance function with a fixed 
+    lengthscale. Cell pixels are indicated by the mask. 
     
-    class SparseGPModel(gpytorch.models.ExactGP):
-        def __init__(self, train_x, train_y, likelihood):
-            super(SparseGPModel, self).__init__(train_x, train_y, likelihood)
+    Parameters:
+        sample: Input sample of shape (M, C, H, W), M - number of modalities, C - number of channels, 
+                H - image height, W - image width. Pixel values should be floats.
+        mask: Binary mask of shape (H, W), where 1 indicates background pixels.
+        sample_fraction: The fraction of local average cell intensity magnitudes to fit the surface to.
+        verbose: A boolean to indicate whether to print detailed information during processing or not.
+    
+    Returns:
+        tuple - Normalized sample and fitted intensity magnitude surfaces as numpy arrays of same size as input sample. 
+    """
+    if verbose: 
+        print(f"Fitting RBC Intensity Magnitude Surface...")
+        
+    # Check format of inputs
+    sample = check_sample_format(sample, allow_multiple=False)
+        
+    assert mask.shape == sample.shape[2:], \
+        f"Error: Mask and sample image dimensions do not match. Got mask shape {mask.shape} and sample image shape {sample.shape[2:]}."
+    
+    
+    class GPModel(gpytorch.models.ExactGP):
+        """ The Gaussian process model.
+
+        Defines a Gaussian process model with a constant mean function and an RBF kernel covariance function with a
+        fixed lengthscale.
+        
+        Attributes:
+            mean_module: The mean function module.
+            covar_module: The covariance function module.
+        """
+        def __init__(self, train_x: torch.Tensor, train_y: torch.Tensor, likelihood: gpytorch.likelihoods.Likelihood):
+            """ Initializes a Gaussian process model instance. """
+            super(GPModel, self).__init__(train_x, train_y, likelihood)
 
             # Constant mean function
             self.mean_module = gpytorch.means.ConstantMean()
@@ -236,13 +293,36 @@ def fit_gpr_surface(sample: np.ndarray,
             # Set fixed lengthscale
             self.covar_module.base_kernel.lengthscale = torch.tensor(200.0).cuda()
 
-        def forward(self, x):
+        def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
+            """ Forward process of the Gaussian process model. """
             mean_x = self.mean_module(x)
             covar_x = self.covar_module(x)
             return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
     
-    def sample_local_average_magnitude(channel, mask, sample_fraction):
+    def sample_local_average_magnitude(
+        channel: np.ndarray, 
+        mask: np.ndarray, 
+        sample_fraction: float
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """ Samples local average cell intensity magnitudes from channel.
+        
+        Computes the local average value by computing the distance between the point and all other points 
+        and taking the average of the nearest neighborhood from a sampled subset points in the image. 
+        
+        Args: 
+            channel: A one channel image (H, W) from which to sample local average intensity magnitudes.
+            mask: Binary mask of shape (H, W), where 1 indicates cell pixels.
+            sample_fraction: The fraction of values to sample.
+        
+        Returns:
+            tuple - Sampled points (x and y coordinates) and corresponding values of local average cell 
+            intensity magnitude.
+        """
+        
+        # Get channel magnitudes instead of intensity
         channel = abs(channel)
+
+        # Extract x, y coordinates, z values and mask values
         H, W = channel.shape
         x, y = np.meshgrid(np.arange(W), np.arange(H))
         x = x.ravel()
@@ -255,7 +335,8 @@ def fit_gpr_surface(sample: np.ndarray,
         y_mask = y[m == 1]
         z_mask = z[m == 1]
 
-        # Sample cell pixels to compute local average from
+        # Sample cell pixels to compute the local average from 
+        # (10 times as many as the sample fraction of the subset we are returning)
         num_cell_samples = int(sample_fraction * 10 * len(x_mask))
         idx = np.random.choice(len(x_mask), size=num_cell_samples, replace=False)
         x_cell_sample = x_mask[idx]
@@ -263,7 +344,7 @@ def fit_gpr_surface(sample: np.ndarray,
         z_cell_sample = z_mask[idx]
         coord_cell_sample = np.vstack((x_cell_sample, y_cell_sample)).T
 
-        # Sample points to compute local average to
+        # Sample points to compute local average at
         num_samples = int(sample_fraction * len(x))
         idx = np.random.choice(len(x), size=num_samples, replace=False)
         x_sample = x[idx]
@@ -271,68 +352,95 @@ def fit_gpr_surface(sample: np.ndarray,
         coord_sample = np.vstack([x_sample, y_sample]).T
 
         # Set neighborhood size
-        # TODO: Phrase in terms of fraction of points? (num_samples)
-        num_neighbors = int(50000*sample_fraction*10)
+        N = 50000           # The neighborhood size in the original image (before sampling)
+        num_neighbors = int(N*sample_fraction*10)   # The neighborhood size after sampling
 
-        # Generate new data points in low-density areas
-        sampled_points = np.zeros((num_samples, coord_sample.shape[1]))
-        sampled_values = np.zeros(num_samples)
-
-        def sample_mean_value(i):
+        def sample_mean_value(i: int) -> tuple[np.ndarray, float]:
+            """ Compute the local average value. """
             distances = np.linalg.norm(coord_cell_sample - coord_sample[i], axis=1)
             nearest_idx = np.argsort(distances)[:num_neighbors]
             mean_value = np.mean(z_cell_sample[nearest_idx])
             return (coord_sample[i], mean_value)
         
+        # Sample local average values in parallel
         results = Parallel(n_jobs=-1)(
             delayed(sample_mean_value)(i) for i in range(num_samples)
         )
 
+        # Collect results into two arrays for the sampled coordinates and computed values
         sampled_points = np.array([result[0] for result in results])
         sampled_values = np.array([result[1] for result in results])
-        
         return sampled_points, sampled_values
 
-    def fit_gpr_channel(channel, mask):
+    def fit_gpr_channel(
+        channel: np.ndarray, 
+        mask: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """ Samples local average cell intensity magnitudes from channel.
+        
+        Computes the local average value by computing the distance between the point and all other points 
+        and taking the average of the nearest neighborhood from a sampled subset points in the image. 
+        
+        Args: 
+            channel: A one channel image (H, W) from which to sample local average intensity magnitudes.
+            mask: Binary mask of shape (H, W), where 1 indicates cell pixels.
+            sample_fraction: The fraction of values to sample.
+        
+        Returns:
+            tuple - Sampled points (x and y coordinates) and corresponding values of local average cell 
+            intensity magnitude.
+        """
+
+        # Set device to gpu if gpu is available
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Extract x, y coordinates, z values and mask values
         H, W = channel.shape
         x, y = np.meshgrid(np.arange(W), np.arange(H))
         x = x.ravel()
         y = y.ravel()
 
+        # Sample a subset of coordinates and corresponding computed local average cell intensity magnitude values
         train_x, train_y = sample_local_average_magnitude(channel, mask, sample_fraction)
-        train_x = torch.tensor(train_x).cuda()
-        train_y = torch.tensor(train_y).cuda()
+        train_x = torch.tensor(train_x, device=device)
+        train_y = torch.tensor(train_y, device=device)
 
         # Define likelihood and model
-        likelihood = gpytorch.likelihoods.GaussianLikelihood().cuda()
-        model = SparseGPModel(train_x, train_y, likelihood).cuda()
+        likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+        model = GPModel(train_x, train_y, likelihood).to(device)
 
         # Train model
         model.train()
         likelihood.train()
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.1)            # Optimizer
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)   # Loss
 
-        for i in range(100):  # Number of training iterations
+        # Train for 100 iterations
+        for i in range(100):
+            # Compute loss
             optimizer.zero_grad()
             output = model(train_x)
             mll_loss = -mll(output, train_y)
-
             loss = mll_loss
+
+            # Backprop and update weights
             loss.backward()
             optimizer.step()
 
-            if (i==50) and (loss.item() > 0):   # Reduce learning rate after 50 iterations
+            # Reduce learning rate after 50 iterations
+            if (i==50) and (loss.item() > 0):
                 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
+        # Write final loss if verbose
         if verbose: 
             print(f"MLL Loss: {mll_loss.item():.4f}")
 
+        # Get surface estimation at all points by model inference
         model.eval()
         likelihood.eval()
-        points = torch.tensor(np.vstack((x, y)).T, dtype=torch.float32).cuda()
-        pred_y = torch.zeros(len(points), dtype=torch.float32, device=points.device)
-        batch_size = 100000
+        points = torch.tensor(np.vstack((x, y)).T, dtype=torch.float32, device=device)
+        pred_y = torch.zeros(len(points), dtype=torch.float32, device=device)
+        batch_size = 100000     # Batch size for model inference
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
             for i in range(0, points.size(0), batch_size):
                 batch = points[i:i + batch_size]
@@ -342,14 +450,13 @@ def fit_gpr_surface(sample: np.ndarray,
 
         # Cleanup memory
         del train_x, train_y, points, model, likelihood
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
 
+        # Return normalized channel (channel / pred_y) and estimated surface (pred_y)
         return channel / pred_y, pred_y
 
-    # Normalize image
-    if verbose: 
-        print(f"Fitting RBC Intensity Magnitude Surface...")
+    # Normalize sample by processing each channel
     normalized_sample = np.zeros_like(sample)
     fitted_surface = np.zeros_like(sample)
     for i in range(sample.shape[0]):
