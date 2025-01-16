@@ -26,7 +26,7 @@ Further, all utility functions are found in the directory utils/, as follows:
 ## Setup
 
 To run the code, a few setup steps are required. 
-1. Install packages listed in 'requirements.txt'. 
+1. Install packages listed in 'environment.yml'. The code is written in python 3.11. 
 2. Set dataset paths. This can be done in two ways. Either set the paths manually in the code when creating dataset objects, or create a file '.env' specifying the paths. This is my preferred method to seemlessly work on multiple devices without having to manually write over paths. The .env file is ignored by git. The .env must contain lines on the following form: 
 
 DATASET_PATH_1 = 'C:/.../dataset1/'  
