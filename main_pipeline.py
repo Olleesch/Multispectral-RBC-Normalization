@@ -8,7 +8,7 @@ from cellpose import models
 from tqdm import tqdm
 
 from utils.data import Dataset
-from utils.surface_estimation import get_masks, fit_polynomial_background, fit_gpr_surface
+from utils.surface_estimation import get_masks, fit_polynomial_background, fit_rbc_surface
 
 
 def load_dataset_paths():
@@ -74,7 +74,7 @@ def main():
             bc_sample, _ = fit_polynomial_background(sample, background_mask, verbose=verbose)
 
             # Get normalized sample
-            norm_sample, _ = fit_gpr_surface(bc_sample, cell_mask, verbose=verbose)
+            norm_sample, _ = fit_rbc_surface(bc_sample, cell_mask, method='b-spline', verbose=verbose)
 
             # Save samples
             save_sample(bc_paths, bc_sample)

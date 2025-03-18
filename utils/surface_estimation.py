@@ -12,6 +12,7 @@ from joblib import Parallel, delayed
 from scipy.optimize import curve_fit
 from scipy.ndimage import binary_dilation, binary_erosion
 from sklearn.preprocessing import minmax_scale
+from scipy.interpolate import bisplrep, bisplev, griddata
 
 from .data import check_sample_format
 
@@ -236,23 +237,30 @@ def fit_polynomial_background(
 
 """ Red Blood Cell Intensity Magnitude Surface Estimation """
 
-def fit_gpr_surface(
+def fit_rbc_surface(
     sample: np.ndarray, 
     mask: np.ndarray, 
+    method: str,
     sample_fraction: float = 0.001,
     verbose: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
-    """ Fits a smooth surface to the local average cell intensity magnitude. 
+    """ Fits a surface to the local average cell intensity magnitude. 
 
-    Fits a smooth surface to sampled values of the local average cell intensity magnitude through Gaussing 
-    process regression with a constant mean function and an RBF kernel covariance function with a fixed 
-    lengthscale. Cell pixels are indicated by the mask. 
+    Fits a surface to sampled values of the local average cell intensity magnitude. Cell pixels are indicated by the mask. 
+
+    Implemented methods include: 
+        Linear: Forms a surface by interpolating all points in the domain from the sampled subset. 
+        B-Spline: Fits a smooth surface using a cubic bivariate spline representation.
+        GPR: Fits a smooth surface through Gaussian process regression with a constant mean function and an RBF kernel 
+        covariance function with a fixed lengthscale. 
     
     Parameters:
         sample: Input sample of shape (M, C, H, W), M - number of modalities, C - number of channels, 
                 H - image height, W - image width. Pixel values should be floats.
-        mask: Binary mask of shape (H, W), where 1 indicates background pixels.
-        sample_fraction: The fraction of local average cell intensity magnitudes to fit the surface to.
+        mask: Binary mask of shape (H, W), where 1 indicates cell pixels.
+        method: Method of fitting the surface to sampled values of the local average cell intensity magnitude. Implemented
+                methods are ['linear', 'b-spline', 'gpr'].
+        sample_fraction: The fraction of local average cell intensity magnitudes to sample and fit the surface to.
         verbose: A boolean to indicate whether to print detailed information during processing or not.
     
     Returns:
@@ -267,37 +275,9 @@ def fit_gpr_surface(
     assert mask.shape == sample.shape[2:], \
         f"Error: Mask and sample image dimensions do not match. Got mask shape {mask.shape} and sample image shape {sample.shape[2:]}."
     
+    assert method.lower() in ["gpr", "b-spline", "linear"], \
+        f"Error: Method '{method}' not implemented. Implemented methods are: 'linear', 'b-spline', 'gpr'."
     
-    class GPModel(gpytorch.models.ExactGP):
-        """ The Gaussian process model.
-
-        Defines a Gaussian process model with a constant mean function and an RBF kernel covariance function with a
-        fixed lengthscale.
-        
-        Attributes:
-            mean_module: The mean function module.
-            covar_module: The covariance function module.
-        """
-        def __init__(self, train_x: torch.Tensor, train_y: torch.Tensor, likelihood: gpytorch.likelihoods.Likelihood):
-            """ Initializes a Gaussian process model instance. """
-            super(GPModel, self).__init__(train_x, train_y, likelihood)
-
-            # Constant mean function
-            self.mean_module = gpytorch.means.ConstantMean()
-
-            # RBF kernel covariance function
-            self.covar_module = gpytorch.kernels.ScaleKernel(
-                gpytorch.kernels.RBFKernel()
-            )
-
-            # Set fixed lengthscale
-            self.covar_module.base_kernel.lengthscale = torch.tensor(200.0).cuda()
-
-        def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
-            """ Forward process of the Gaussian process model. """
-            mean_x = self.mean_module(x)
-            covar_x = self.covar_module(x)
-            return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
     
     def sample_local_average_magnitude(
         channel: np.ndarray, 
@@ -307,7 +287,7 @@ def fit_gpr_surface(
         """ Samples local average cell intensity magnitudes from channel.
         
         Computes the local average value by computing the distance between the point and all other points 
-        and taking the average of the nearest neighborhood from a sampled subset points in the image. 
+        and taking the average of the nearest neighborhood from a sampled subset of points in the image. 
         
         Args: 
             channel: A one channel image (H, W) from which to sample local average intensity magnitudes.
@@ -349,6 +329,13 @@ def fit_gpr_surface(
         idx = np.random.choice(len(x), size=num_samples, replace=False)
         x_sample = x[idx]
         y_sample = y[idx]
+
+        # To create a convex hull that includes the entire image, we manually add the four image 
+        # corners to the sampled coordinates (required by the linear interpolation method)
+        num_samples += 4
+        x_sample = np.concatenate([x_sample, [0, 0, W-1, W-1]])
+        y_sample = np.concatenate([y_sample, [0, H-1, 0, H-1]])
+
         coord_sample = np.vstack([x_sample, y_sample]).T
 
         # Set neighborhood size
@@ -376,20 +363,47 @@ def fit_gpr_surface(
         channel: np.ndarray, 
         mask: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """ Samples local average cell intensity magnitudes from channel.
-        
-        Computes the local average value by computing the distance between the point and all other points 
-        and taking the average of the nearest neighborhood from a sampled subset points in the image. 
+        """ Fits a smooth surface through Gaussian process regression with a constant mean function and an RBF kernel 
+        covariance function with a fixed lengthscale. 
         
         Args: 
             channel: A one channel image (H, W) from which to sample local average intensity magnitudes.
             mask: Binary mask of shape (H, W), where 1 indicates cell pixels.
-            sample_fraction: The fraction of values to sample.
         
         Returns:
-            tuple - Sampled points (x and y coordinates) and corresponding values of local average cell 
-            intensity magnitude.
+            tuple - The normalized channel and estimated surface.
         """
+        
+        class GPModel(gpytorch.models.ExactGP):
+            """ The Gaussian process model.
+
+            Defines a Gaussian process model with a constant mean function and an RBF kernel covariance function with a
+            fixed lengthscale.
+            
+            Attributes:
+                mean_module: The mean function module.
+                covar_module: The covariance function module.
+            """
+            def __init__(self, train_x: torch.Tensor, train_y: torch.Tensor, likelihood: gpytorch.likelihoods.Likelihood):
+                """ Initializes a Gaussian process model instance. """
+                super(GPModel, self).__init__(train_x, train_y, likelihood)
+
+                # Constant mean function
+                self.mean_module = gpytorch.means.ConstantMean()
+
+                # RBF kernel covariance function
+                self.covar_module = gpytorch.kernels.ScaleKernel(
+                    gpytorch.kernels.RBFKernel()
+                )
+
+                # Set fixed lengthscale
+                self.covar_module.base_kernel.lengthscale = torch.tensor(200.0).cuda()
+
+            def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
+                """ Forward process of the Gaussian process model. """
+                mean_x = self.mean_module(x)
+                covar_x = self.covar_module(x)
+                return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
         # Set device to gpu if gpu is available
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -401,13 +415,13 @@ def fit_gpr_surface(
         y = y.ravel()
 
         # Sample a subset of coordinates and corresponding computed local average cell intensity magnitude values
-        train_x, train_y = sample_local_average_magnitude(channel, mask, sample_fraction)
-        train_x = torch.tensor(train_x, device=device)
-        train_y = torch.tensor(train_y, device=device)
+        train_points, train_values = sample_local_average_magnitude(channel, mask, sample_fraction)
+        train_points = torch.tensor(train_points, device=device)
+        train_values = torch.tensor(train_values, device=device)
 
         # Define likelihood and model
         likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-        model = GPModel(train_x, train_y, likelihood).to(device)
+        model = GPModel(train_points, train_values, likelihood).to(device)
 
         # Train model
         model.train()
@@ -419,8 +433,8 @@ def fit_gpr_surface(
         for i in range(100):
             # Compute loss
             optimizer.zero_grad()
-            output = model(train_x)
-            mll_loss = -mll(output, train_y)
+            output = model(train_points)
+            mll_loss = -mll(output, train_values)
             loss = mll_loss
 
             # Backprop and update weights
@@ -439,30 +453,134 @@ def fit_gpr_surface(
         model.eval()
         likelihood.eval()
         points = torch.tensor(np.vstack((x, y)).T, dtype=torch.float32, device=device)
-        pred_y = torch.zeros(len(points), dtype=torch.float32, device=device)
+        pred_values = torch.zeros(len(points), dtype=torch.float32, device=device)
         batch_size = 100000     # Batch size for model inference
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
             for i in range(0, points.size(0), batch_size):
                 batch = points[i:i + batch_size]
                 output = model(batch).mean
-                pred_y[i:i + batch_size] = output
-        pred_y = pred_y.cpu().numpy().reshape(H, W)
+                pred_values[i:i + batch_size] = output
+        pred_values = pred_values.cpu().numpy().reshape(H, W)
 
         # Cleanup memory
-        del train_x, train_y, points, model, likelihood
+        del train_points, train_values, points, model, likelihood
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
 
-        # Return normalized channel (channel / pred_y) and estimated surface (pred_y)
-        return channel / pred_y, pred_y
+        if verbose:
+            print(f"Min: {pred_values.min():.3f}, Max: {pred_values.max():.3f}, Min abs: {abs(pred_values).min():.3f}")
 
-    # Normalize sample by processing each channel
+        # Return normalized channel (channel / pred_values) and estimated surface (pred_values)
+        return channel / pred_values, pred_values
+    
+    def fit_bspline_channel(
+        channel: np.ndarray, 
+        mask: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """ Fits a smooth surface using a cubic bivariate spline representation. 
+        
+        Args: 
+            channel: A one channel image (H, W) from which to sample local average intensity magnitudes.
+            mask: Binary mask of shape (H, W), where 1 indicates cell pixels.
+        
+        Returns:
+            tuple - The normalized channel and estimated surface.
+        """
+        
+        # Sample a subset of coordinates and corresponding computed local average cell intensity magnitude values
+        H, W = channel.shape
+        train_points, train_values = sample_local_average_magnitude(channel, mask, sample_fraction)
+        x_train = train_points[:,0]
+        y_train = train_points[:,1]
+        
+        # Fit cubic bivariate spline to sampled data
+        kx = 3
+        ky = 3
+        tck = bisplrep(
+            x=x_train,
+            y=y_train,
+            z=train_values,
+            kx=kx,
+            ky=ky,
+            s=0.025,
+            task=0
+        )
+
+        # Evaluate the spline over the full grid
+        pred_z = bisplev(np.arange(W), np.arange(H), tck).T
+
+        if verbose:
+            print(f"Min: {pred_z.min():.3f}, Max: {pred_z.max():.3f}, Min abs: {abs(pred_z).min():.3f}")
+
+        # Return normalized channel (channel / pred_z) and estimated surface (pred_z)
+        return channel / pred_z, pred_z
+    
+    def linear_interpolate_channel(
+        channel: np.ndarray,
+        mask: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """ Forms a surface by interpolating all points in the domain from the sampled subset. 
+        
+        Args: 
+            channel: A one channel image (H, W) from which to sample local average intensity magnitudes.
+            mask: Binary mask of shape (H, W), where 1 indicates cell pixels.
+        
+        Returns:
+            tuple - The normalized channel and estimated surface.
+        """
+        
+        # Sample a subset of coordinates and corresponding computed local average cell intensity magnitude values
+        H, W = channel.shape
+        train_points, train_values = sample_local_average_magnitude(channel, mask, sample_fraction)
+        x_train = train_points[:,0]
+        y_train = train_points[:,1]
+        
+        # Linearly interpolate entire domain from sampled points
+        x, y = np.meshgrid(np.arange(W), np.arange(H))
+        pred_z = griddata((x_train, y_train), train_values, (x, y), method='linear')
+
+        if verbose:
+            print(f"Min: {pred_z.min():.3f}, Max: {pred_z.max():.3f}, Min abs: {abs(pred_z).min():.3f}")
+
+        # Return normalized channel (channel / pred_z) and estimated surface (pred_z)
+        return channel / pred_z, pred_z
+        
+    # Allocate normalized sample and fitted background
     normalized_sample = np.zeros_like(sample)
     fitted_surface = np.zeros_like(sample)
-    for i in range(sample.shape[0]):
-        for c in range(sample.shape[1]):
-            if verbose: 
-                print(f"Processing Channel: {c}")
-            normalized_sample[i,c], fitted_surface[i,c] = fit_gpr_channel(sample[i,c], mask)
+
+    # Linear interpolation method
+    if method.lower() == "linear":
+        # Fit polynomial planes to each channel in parallel
+        results = Parallel(n_jobs=-1)(
+            delayed(lambda i, c: (i, c, *linear_interpolate_channel(sample[i, c], mask)))(i, c) 
+            for i in range(sample.shape[0]) 
+            for c in range(sample.shape[1])
+        )
+        # Assign results to the original arrays
+        for i, c, norm_channel, fitted_surf in results:
+            normalized_sample[i, c] = norm_channel
+            fitted_surface[i, c] = fitted_surf
+        
+    # Cubic bivariate spline fitting method
+    elif method.lower() == "b-spline":
+        # Fit polynomial planes to each channel in parallel
+        results = Parallel(n_jobs=-1)(
+            delayed(lambda i, c: (i, c, *fit_bspline_channel(sample[i, c], mask)))(i, c) 
+            for i in range(sample.shape[0]) 
+            for c in range(sample.shape[1])
+        )
+        # Assign results to the original arrays
+        for i, c, norm_channel, fitted_surf in results:
+            normalized_sample[i, c] = norm_channel
+            fitted_surface[i, c] = fitted_surf
+    
+    # Gaussian process regression method
+    elif method.lower() == "gpr":
+        for i in range(sample.shape[0]):
+            for c in range(sample.shape[1]):
+                if verbose: 
+                    print(f"Processing Modality/Channel: {i}/{c}")
+                normalized_sample[i,c], fitted_surface[i,c] = fit_gpr_channel(sample[i,c], mask)
 
     return normalized_sample, fitted_surface
